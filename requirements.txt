@@ -1,0 +1,18 @@
+# Core app & UI
+streamlit>=1.37.0
+
+# Data wrangling & Excel export
+pandas>=2.2.2
+xlsxwriter>=3.2.0
+openpyxl>=3.1.2  # enables reading/writing .xlsx when needed
+
+# HTML parsing for pandas.read_html
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+html5lib>=1.1
+
+# Browser automation
+selenium>=4.14.0  # uses Selenium Manager; no manual driver needed
+
+# Windows-only (for Outlook email sending)
+pywin32>=306; platform_system == "Windows"
