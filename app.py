@@ -1,9 +1,9 @@
 # app.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Streamlit TBN Scraper App (Production-ready, cross-platform)
+# Streamlit TBN Scraper App (Production-ready, cross-platform, no Playwright)
 #
 # Highlights:
-# - Auto-installs Chromium (via Playwright) if Chrome is missing
+# - Auto-installs Chrome for Testing (CfT) + matching ChromeDriver if Chrome isn't present
 # - Manual-login fallback for MFA/CAPTCHA
 # - Headless by default; visible window only if manual login is enabled
 # - Responsive Streamlit UI (works on phones when hosted)
@@ -14,12 +14,14 @@
 import os
 import re
 import sys
-import time
 import json
+import time
 import shutil
-import pathlib
+import zipfile
 import tempfile
-import subprocess
+import platform
+import pathlib
+import urllib.request
 from datetime import datetime
 from io import StringIO
 from typing import List, Dict, Optional, Tuple
@@ -33,6 +35,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException
@@ -87,35 +90,137 @@ def validate_email_list(raw: str) -> List[str]:
     return emails
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Chromium bootstrap (self-healing)
+# Chrome for Testing (CfT) bootstrap — self-healing without Playwright
 # ─────────────────────────────────────────────────────────────────────────────
-def _ensure_playwright_chromium() -> str:
-    """
-    Ensure a Chromium binary exists (Playwright). Returns path to the binary.
-    Works without root; installs into ~/.cache/ms-playwright on first use.
-    """
-    try:
-        import playwright  # noqa: F401
-    except Exception:
-        subprocess.run([sys.executable, "-m", "pip", "install", "playwright>=1.46"], check=True)
-    # Install browser (idempotent)
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"], check=True)
+CFT_INFO_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
 
-    home = pathlib.Path.home()
-    # Typical locations
-    candidates = list(home.glob(".cache/ms-playwright/chromium-*/chrome-linux/chrome"))
-    if not candidates:
-        candidates = list(home.glob(".cache/ms-playwright/chromium-*/chromium/chrome"))
-    if not candidates:
-        raise RuntimeError("Playwright Chromium install succeeded but the chrome binary was not found.")
-    return str(candidates[0])
+def _platform_tag() -> str:
+    """Return CfT platform tag: linux64 | mac-x64 | mac-arm64 | win32 | win64."""
+    sysname = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if sysname == "linux":
+        return "linux64"
+    if sysname == "darwin":
+        return "mac-arm64" if ("arm" in machine or "aarch" in machine) else "mac-x64"
+    if sysname == "windows":
+        # Most modern Windows are 64-bit
+        return "win64" if ("64" in machine or os.environ.get("PROGRAMFILES(X86)")) else "win32"
+    # Fallback
+    return "linux64"
+
+def _download(url: str, dst: pathlib.Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as resp, open(dst, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+def _ensure_cft() -> Tuple[str, str]:
+    """
+    Ensure Chrome for Testing (chrome binary) and chromedriver exist for this platform.
+    Returns (chrome_binary_path, chromedriver_path).
+    Caches under ~/.cache/cft/<version>/<platform>/...
+    """
+    tag = _platform_tag()
+    cache_root = pathlib.Path.home() / ".cache" / "cft"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # Fetch CfT metadata
+    with urllib.request.urlopen(CFT_INFO_URL) as resp:
+        meta = json.load(resp)
+
+    stable = meta["channels"]["Stable"]["version"]
+    downloads = meta["channels"]["Stable"]["downloads"]
+    chrome_urls = [d["url"] for d in downloads["chrome"] if d["platform"] == tag]
+    driver_urls = [d["url"] for d in downloads["chromedriver"] if d["platform"] == tag]
+    if not chrome_urls or not driver_urls:
+        raise RuntimeError(f"No CfT downloads for platform '{tag}'")
+
+    chrome_zip_url = chrome_urls[0]
+    driver_zip_url = driver_urls[0]
+
+    version_dir = cache_root / stable / tag
+    chrome_dir = version_dir / "chrome"
+    driver_dir = version_dir / "chromedriver"
+    chrome_bin = None
+    driver_bin = None
+
+    # Detect already extracted
+    if "linux" in tag:
+        chrome_bin = chrome_dir / "chrome-linux" / "chrome"
+        driver_bin = driver_dir / "chromedriver-linux64" / "chromedriver"
+    elif tag == "mac-x64":
+        chrome_bin = chrome_dir / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+        driver_bin = driver_dir / "chromedriver-mac-x64" / "chromedriver"
+    elif tag == "mac-arm64":
+        chrome_bin = chrome_dir / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+        driver_bin = driver_dir / "chromedriver-mac-arm64" / "chromedriver"
+    elif tag in ("win32", "win64"):
+        chrome_bin = chrome_dir / f"chrome-{tag}" / "chrome.exe"
+        driver_bin = driver_dir / f"chromedriver-{tag}" / "chromedriver.exe"
+
+    # Download/extract if missing
+    if not (chrome_bin and chrome_bin.exists()) or not (driver_bin and driver_bin.exists()):
+        # Clean version dir to avoid mixing versions
+        if version_dir.exists():
+            shutil.rmtree(version_dir, ignore_errors=True)
+        chrome_dir.mkdir(parents=True, exist_ok=True)
+        driver_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download zips
+        chrome_zip = version_dir / "chrome.zip"
+        driver_zip = version_dir / "chromedriver.zip"
+        _download(chrome_zip_url, chrome_zip)
+        _download(driver_zip_url, driver_zip)
+
+        # Extract
+        with zipfile.ZipFile(chrome_zip, "r") as z:
+            z.extractall(chrome_dir)
+        with zipfile.ZipFile(driver_zip, "r") as z:
+            z.extractall(driver_dir)
+
+        # Recompute bin paths after extraction (same as above)
+        if "linux" in tag:
+            chrome_bin = chrome_dir / "chrome-linux" / "chrome"
+            driver_bin = driver_dir / "chromedriver-linux64" / "chromedriver"
+        elif tag == "mac-x64":
+            chrome_bin = chrome_dir / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+            driver_bin = driver_dir / "chromedriver-mac-x64" / "chromedriver"
+        elif tag == "mac-arm64":
+            chrome_bin = chrome_dir / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+            driver_bin = driver_dir / "chromedriver-mac-arm64" / "chromedriver"
+        elif tag in ("win32", "win64"):
+            chrome_bin = chrome_dir / f"chrome-{tag}" / "chrome.exe"
+            driver_bin = driver_dir / f"chromedriver-{tag}" / "chromedriver.exe"
+
+        # Make sure binaries are executable on *nix
+        try:
+            if chrome_bin and chrome_bin.exists() and os.name != "nt":
+                chrome_bin.chmod(0o755)
+            if driver_bin and driver_bin.exists() and os.name != "nt":
+                driver_bin.chmod(0o755)
+        except Exception:
+            pass
+
+        # Clean zip files
+        try:
+            chrome_zip.unlink(missing_ok=True)
+            driver_zip.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not chrome_bin or not chrome_bin.exists():
+        raise RuntimeError("Chrome for Testing binary not found after install.")
+    if not driver_bin or not driver_bin.exists():
+        raise RuntimeError("ChromeDriver binary not found after install.")
+
+    return (str(chrome_bin), str(driver_bin))
 
 def build_chrome(manual_visible: bool = False) -> webdriver.Chrome:
     """
-    Build a Chrome driver that 'just works' on any device/host.
-    - Uses system Chrome/Chromium if present (or CHROME_PATH env).
-    - Otherwise auto-installs Playwright Chromium and retries.
-    - Headless unless manual_visible=True (for manual login/MFA).
+    Build a Chrome driver that 'just works':
+      1) Use CHROME_PATH env or a system chrome/chromium if present.
+      2) Else auto-download Chrome for Testing + matching ChromeDriver and use them.
+    Headless unless manual_visible=True.
     """
     opts = ChromeOptions()
     if not manual_visible:
@@ -127,30 +232,34 @@ def build_chrome(manual_visible: bool = False) -> webdriver.Chrome:
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    # Try CHROME_PATH; else look for system chrome/chromium
-    chrome_path = os.getenv("CHROME_PATH")
-    if chrome_path and os.path.exists(chrome_path):
-        opts.binary_location = chrome_path
-    else:
-        for candidate in ["google-chrome", "chromium", "chromium-browser"]:
-            p = shutil.which(candidate)
+    # 1) Try env/system chrome
+    binary = os.getenv("CHROME_PATH")
+    if not binary:
+        for cand in ("google-chrome", "chromium", "chromium-browser"):
+            p = shutil.which(cand)
             if p:
-                opts.binary_location = p
+                binary = p
                 break
 
+    if binary:
+        opts.binary_location = binary
+        try:
+            driver = webdriver.Chrome(options=opts)  # Selenium Manager finds driver for system chrome
+            driver.set_page_load_timeout(45)
+            return driver
+        except WebDriverException:
+            # fallback to CfT
+            pass
+
+    # 2) CfT fallback
+    chrome_bin, driver_bin = _ensure_cft()
+    opts.binary_location = chrome_bin
+    service = ChromeService(executable_path=driver_bin)
     try:
-        driver = webdriver.Chrome(options=opts)  # Selenium Manager fetches driver
+        driver = webdriver.Chrome(service=service, options=opts)
         driver.set_page_load_timeout(45)
         return driver
     except WebDriverException as e:
-        msg = str(e)
-        # Typical in containers: missing Chrome -> chromedriver exit code 127 or 'cannot find'
-        if "Status code was: 127" in msg or "cannot find" in msg.lower() or "no such file" in msg.lower():
-            chromium_bin = _ensure_playwright_chromium()
-            opts.binary_location = chromium_bin
-            driver = webdriver.Chrome(options=opts)
-            driver.set_page_load_timeout(45)
-            return driver
         raise RuntimeError(f"Failed to start Chrome. Details: {e}") from e
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -705,4 +814,4 @@ if run_button:
         st.stop()
 
 # Footer
-st.caption("For production, consider hosting on a server (EC2/Render/Streamlit Cloud) and accessing from your phone.")
+st.caption("Host this app (e.g., on a VM/Cloud) and open the URL from your laptop or iPhone. The scraper runs on the host.")
