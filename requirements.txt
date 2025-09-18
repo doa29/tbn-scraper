@@ -14,8 +14,5 @@ html5lib>=1.1
 # Browser automation
 selenium>=4.22.0
 
-# Self-healing: auto-install Chromium when Chrome isn't present
-playwright>=1.46
-
 # Windows-only (Outlook email option)
 pywin32>=306; platform_system == "Windows"
