@@ -1,32 +1,25 @@
+# app.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Streamlit TBN Scraper App  —  UPDATED
+# Streamlit TBN Scraper App (Production-ready, cross-platform)
 #
-# Fixes added:
-# 1) Robust login: submit the <form> element so hidden CSRF tokens are sent.
-# 2) Manual-login mode now copies session cookies into a headless driver.
-# 3) Hardened datepicker selectors and waits.
-# 4) Better diagnostics: cookie names + HTML snippet on failure.
-#
-# Features:
-# - Secure credential entry (no plaintext storage) for TBN portal
-# - Supports single years, ranges (e.g., 2020-2024), and comma lists (e.g., 2023,2025)
-# - Optional upload of prior scraped JSON/CSV for YoY comparisons
-# - Headless Selenium scrape, robust error handling & progress UI
-# - Generates Excel with ADA notes & weekend shading
-# - Download results in-app and (optionally) email via Outlook or SMTP
-#
-# Dependencies (pip):
-#   streamlit pandas beautifulsoup4 selenium python-dotenv xlsxwriter lxml html5lib openpyxl
-#   (Optional) pywin32 (Outlook), yagmail (or use stdlib smtplib)
-#
-# Respect website terms. Scrape only content you are authorized to access.
+# Highlights:
+# - Auto-installs Chromium (via Playwright) if Chrome is missing
+# - Manual-login fallback for MFA/CAPTCHA
+# - Headless by default; visible window only if manual login is enabled
+# - Responsive Streamlit UI (works on phones when hosted)
+# - SMTP / Outlook email options
+# - Past-data comparisons, Excel export, downloads
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
 import re
+import sys
 import time
 import json
+import shutil
+import pathlib
 import tempfile
+import subprocess
 from datetime import datetime
 from io import StringIO
 from typing import List, Dict, Optional, Tuple
@@ -35,7 +28,7 @@ import streamlit as st
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# Selenium imports
+# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -47,7 +40,7 @@ from selenium.common.exceptions import WebDriverException
 # Excel writer
 import xlsxwriter  # noqa: F401
 
-# Outlook optional
+# Outlook (optional, Windows)
 try:
     import win32com.client as win32  # type: ignore
     HAS_OUTLOOK = True
@@ -57,8 +50,8 @@ except Exception:
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-LOGIN_URL  = 'https://portal.thebusnetwork.com/login'
-REPORT_URL = 'https://portal.thebusnetwork.com/salesman/reports/daily-usage'
+LOGIN_URL  = os.getenv("TBN_LOGIN_URL", "https://portal.thebusnetwork.com/login")
+REPORT_URL = os.getenv("TBN_REPORT_URL", "https://portal.thebusnetwork.com/salesman/reports/daily-usage")
 
 def EXCEL_PATH(tmpdir: str, y: int) -> str:
     return os.path.join(tmpdir, f"TBN_Report_{y}.xlsx")
@@ -79,12 +72,12 @@ def parse_years_input(text: str) -> List[int]:
             if a.isdigit() and b.isdigit():
                 lo, hi = int(a), int(b)
                 if lo <= hi:
-                    years.extend(list(range(lo, hi + 1)))
+                    years.extend(range(lo, hi + 1))
         else:
             if part.isdigit():
                 years.append(int(part))
     years = [y for y in years if 2000 <= y <= 2100]
-    return sorted(list(set(years)))
+    return sorted(set(years))
 
 def validate_email_list(raw: str) -> List[str]:
     emails = [e.strip() for e in re.split(r"[;,]", raw) if e.strip()]
@@ -94,9 +87,36 @@ def validate_email_list(raw: str) -> List[str]:
     return emails
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Selenium setup & auth
+# Chromium bootstrap (self-healing)
 # ─────────────────────────────────────────────────────────────────────────────
+def _ensure_playwright_chromium() -> str:
+    """
+    Ensure a Chromium binary exists (Playwright). Returns path to the binary.
+    Works without root; installs into ~/.cache/ms-playwright on first use.
+    """
+    try:
+        import playwright  # noqa: F401
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "playwright>=1.46"], check=True)
+    # Install browser (idempotent)
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"], check=True)
+
+    home = pathlib.Path.home()
+    # Typical locations
+    candidates = list(home.glob(".cache/ms-playwright/chromium-*/chrome-linux/chrome"))
+    if not candidates:
+        candidates = list(home.glob(".cache/ms-playwright/chromium-*/chromium/chrome"))
+    if not candidates:
+        raise RuntimeError("Playwright Chromium install succeeded but the chrome binary was not found.")
+    return str(candidates[0])
+
 def build_chrome(manual_visible: bool = False) -> webdriver.Chrome:
+    """
+    Build a Chrome driver that 'just works' on any device/host.
+    - Uses system Chrome/Chromium if present (or CHROME_PATH env).
+    - Otherwise auto-installs Playwright Chromium and retries.
+    - Headless unless manual_visible=True (for manual login/MFA).
+    """
     opts = ChromeOptions()
     if not manual_visible:
         opts.add_argument("--headless=new")
@@ -107,145 +127,114 @@ def build_chrome(manual_visible: bool = False) -> webdriver.Chrome:
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    chrome_path = os.environ.get("CHROME_PATH")
+    # Try CHROME_PATH; else look for system chrome/chromium
+    chrome_path = os.getenv("CHROME_PATH")
     if chrome_path and os.path.exists(chrome_path):
         opts.binary_location = chrome_path
+    else:
+        for candidate in ["google-chrome", "chromium", "chromium-browser"]:
+            p = shutil.which(candidate)
+            if p:
+                opts.binary_location = p
+                break
 
     try:
-        drv = webdriver.Chrome(options=opts)
-        drv.set_page_load_timeout(45)
-        return drv
+        driver = webdriver.Chrome(options=opts)  # Selenium Manager fetches driver
+        driver.set_page_load_timeout(45)
+        return driver
     except WebDriverException as e:
+        msg = str(e)
+        # Typical in containers: missing Chrome -> chromedriver exit code 127 or 'cannot find'
+        if "Status code was: 127" in msg or "cannot find" in msg.lower() or "no such file" in msg.lower():
+            chromium_bin = _ensure_playwright_chromium()
+            opts.binary_location = chromium_bin
+            driver = webdriver.Chrome(options=opts)
+            driver.set_page_load_timeout(45)
+            return driver
         raise RuntimeError(f"Failed to start Chrome. Details: {e}") from e
 
-def copy_cookies(src_drv: webdriver.Chrome, dst_drv: webdriver.Chrome, domain_hint: str):
-    """Copy cookies from a logged-in visible session to headless."""
-    cookies = src_drv.get_cookies()
-    # Must be on same domain to add cookies
-    dst_drv.get(domain_hint)
-    for c in cookies:
-        c.pop("sameSite", None)  # selenium may reject unknown fields
-        try:
-            dst_drv.add_cookie(c)
-        except Exception:
-            pass
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Selenium login & scraping
+# ─────────────────────────────────────────────────────────────────────────────
 def login_and_get_driver(username: str, password: str, log_area=None) -> webdriver.Chrome:
-    """Headless automated login with robust form submit & diagnostics."""
+    """
+    Automated login. If your portal enforces CAPTCHA/MFA, use the manual login mode.
+    """
     drv = build_chrome(manual_visible=False)
     drv.get(LOGIN_URL)
     wait = WebDriverWait(drv, 30)
 
-    # Enter iframe if present
+    # If the login is within an iframe, switch in
     frames = drv.find_elements(By.TAG_NAME, "iframe")
-    in_iframe = False
     if frames:
         try:
             drv.switch_to.frame(frames[0])
-            in_iframe = True
             if log_area: log_area.info("Switched into login iframe.")
         except Exception:
-            in_iframe = False
+            pass
 
     def find_el(css):
         return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
 
     try:
-        # Try to locate a form node so hidden inputs (CSRF) go with submission
-        try:
-            form = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "form")))
-        except Exception:
-            form = None
-
-        # Fill fields
+        # Email/username
         email = find_el("input[name='email'], input#email, input#username, input[type='email']")
         email.clear(); email.send_keys(username)
 
+        # Password
         pwd = find_el("input[name='password'], input#password, input[type='password']")
         pwd.clear(); pwd.send_keys(password)
 
-        # Submit the form element first; fall back to clickable button; then Enter
-        if form:
-            drv.execute_script("arguments[0].submit();", form)
-        else:
-            try:
-                btn = wait.until(EC.element_to_be_clickable((
-                    By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], button"
-                )))
-                drv.execute_script("arguments[0].click();", btn)
-            except Exception:
-                pwd.send_keys(Keys.ENTER)
+        # Submit button + Enter (cover both patterns)
+        try:
+            btn = wait.until(EC.element_to_be_clickable((
+                By.XPATH, "//button[@type='submit' or contains(., 'Log') or contains(., 'Sign')]"
+            )))
+            time.sleep(0.5)
+            btn.click()
+        except Exception:
+            pass
+        time.sleep(0.5)
+        pwd.send_keys(Keys.ENTER)
 
-        if in_iframe:
-            drv.switch_to.default_content()
-
-        # Wait for either success or a bounce to login
-        WebDriverWait(drv, 15).until(EC.any_of(
-            EC.url_contains("/login"),
-            EC.url_contains("/salesman"),
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table, .table, div[data-report], #report"))
-        ))
-
-        # Try to visit report page; if not authenticated, most apps redirect to /login
-        drv.get(REPORT_URL)
+        drv.switch_to.default_content()
         time.sleep(2)
 
-        current = drv.current_url.lower()
-        authed = ("login" not in current) and bool(
-            drv.find_elements(By.CSS_SELECTOR, "table, .table, div[data-report], #report")
-        )
-        if not authed:
-            # Diagnostics
-            snippet = (drv.page_source or "")[:1500]
-            cookies = [c.get("name") for c in drv.get_cookies()]
-            if log_area:
-                log_area.error("Login appears to have failed; showing diagnostics.")
-                log_area.code(f"URL: {drv.current_url}\nCookies: {cookies}\n\nHTML (first 1500):\n{snippet}")
-                try:
-                    st.image(drv.get_screenshot_as_png(), caption="Post-login state (screenshot)")
-                except Exception:
-                    pass
-            raise RuntimeError("Login appears to have failed; redirected back to login page or no report found.")
+        # Probe the report page to confirm auth
+        drv.get(REPORT_URL)
+        time.sleep(2)
+        if ("login" in drv.current_url.lower()) or ("signin" in drv.current_url.lower()):
+            drv.refresh()
+            time.sleep(2)
 
-        if log_area: log_area.success("Authenticated successfully (headless).")
-        return drv
-
-    except Exception:
-        # Surface page snippet for debugging then re-raise
+        # Check for the report/table presence
         try:
-            snippet = drv.page_source[:1500]
-            cookies = [c.get("name") for c in drv.get_cookies()]
-            if log_area:
-                log_area.code(f"URL: {drv.current_url}\nCookies: {cookies}\n\nHTML (first 1500):\n{snippet}")
-        finally:
-            drv.quit()
+            WebDriverWait(drv, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table, .table, div[data-report], #report"))
+            )
+        except Exception:
+            raise RuntimeError("Login failed or report not found.")
+
+        if log_area: log_area.success("Authenticated successfully.")
+        return drv
+    except Exception:
+        snippet = drv.page_source[:800] if drv.page_source else "No page source available."
+        if log_area:
+            log_area.code(f"URL: {drv.current_url}\n\nHTML (first 800 chars):\n{snippet}")
+        drv.quit()
         raise
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scraping helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def set_datepicker(drv: webdriver.Chrome, month: int, year: int):
+def set_datepicker(drv, month: int, year: int):
     wait = WebDriverWait(drv, 20)
-    selectors = [
-        'div.styles_dateTimePickerInputGroup__2urdc input.datetimepicker-input',
-        'input[name*="date"][type="text"]',
-        'input.form-control.datetimepicker-input'
-    ]
-    inp = None
-    for css in selectors:
-        try:
-            inp = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, css)))
-            break
-        except Exception:
-            continue
-    if not inp:
-        raise RuntimeError("Could not find the report date input.")
+    inp  = wait.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR, 'div.styles_dateTimePickerInputGroup__2urdc input.datetimepicker-input')
+    ))
     inp.clear()
     inp.send_keys(f"{month:02d}/{year}")
     inp.send_keys(Keys.TAB)
-    time.sleep(1.5)
+    time.sleep(2)
 
-def scrape_month_data(drv: webdriver.Chrome, year: int, month: int) -> Optional[pd.DataFrame]:
+def scrape_month_data(drv, year: int, month: int) -> Optional[pd.DataFrame]:
     drv.get(REPORT_URL)
     time.sleep(1.5)
     set_datepicker(drv, month, year)
@@ -259,7 +248,7 @@ def scrape_month_data(drv: webdriver.Chrome, year: int, month: int) -> Optional[
     df['Year']  = year
     return df
 
-def collect_all_data_for_year(drv: webdriver.Chrome, year: int, progress=None) -> pd.DataFrame:
+def collect_all_data_for_year(drv, year: int, progress=None) -> pd.DataFrame:
     all_df = []
     for m in range(1, 13):
         if progress:
@@ -267,12 +256,10 @@ def collect_all_data_for_year(drv: webdriver.Chrome, year: int, progress=None) -
         df = scrape_month_data(drv, year, m)
         if df is not None:
             all_df.append(df)
-    if not all_df:
-        return pd.DataFrame()
-    return pd.concat(all_df, ignore_index=True)
+    return pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Excel builder
+# Report builder (full Excel, ADA markers + weekend shading + comparisons)
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: str, old_raw_df: Optional[pd.DataFrame] = None):
     monthly_totals_new: Dict[int, Dict[int, int]] = {}
@@ -281,30 +268,24 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
     for m in range(1, 13):
         sub = new_data[new_data['Month'] == m]
 
-        # Totals
+        # Totals row
         tot = sub[sub['Vehicle Types'].str.upper().str.contains("TOTAL", na=False)]
         if not tot.empty:
             tot = tot.iloc[0]
         else:
             days = [str(d) for d in range(1, 32) if str(d) in sub.columns]
             tot = sub[days].sum(numeric_only=True)
-        monthly_totals_new[m] = {
-            d: int(tot.get(str(d), 0)) if pd.notnull(tot.get(str(d), 0)) else 0
-            for d in range(1, 32)
-        }
+        monthly_totals_new[m] = {d: int(tot.get(str(d), 0) or 0) for d in range(1, 32)}
 
-        # ADA
+        # ADA (Wheelchair)
         wc = sub[sub['Vehicle Types'].str.contains("Wheelchair", case=False, na=False)]
         if not wc.empty:
             wc = wc.iloc[0]
-            monthly_ada_new[m] = {
-                d: int(wc.get(str(d), 0)) if pd.notnull(wc.get(str(d), 0)) else 0
-                for d in range(1, 32)
-            }
+            monthly_ada_new[m] = {d: int(wc.get(str(d), 0) or 0) for d in range(1, 32)}
         else:
             monthly_ada_new[m] = {d: 0 for d in range(1, 32)}
 
-    # Old totals for arrows
+    # Old totals (for comparisons)
     if old_raw_df is not None and not old_raw_df.empty:
         monthly_totals_old: Optional[Dict[int, Dict[int, int]]] = {}
         for m in range(1, 13):
@@ -315,10 +296,7 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
             else:
                 days = [str(d) for d in range(1, 32) if str(d) in sub.columns]
                 tot = sub[days].sum(numeric_only=True)
-            monthly_totals_old[m] = {
-                d: int(tot.get(str(d), 0)) if pd.notnull(tot.get(str(d), 0)) else 0
-                for d in range(1, 32)
-            }
+            monthly_totals_old[m] = {d: int(tot.get(str(d), 0) or 0) for d in range(1, 32)}
     else:
         monthly_totals_old = None
 
@@ -383,10 +361,8 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
                     arrow = ""
                     if old_df is not None and day in old_df.index:
                         diff = new_val - int(old_df.at[day, mname])
-                        if diff > 0:
-                            arrow = f" ↑{diff}"
-                        elif diff < 0:
-                            arrow = f" ↓{abs(diff)}"
+                        if diff > 0: arrow = f" ↑{diff}"
+                        elif diff < 0: arrow = f" ↓{abs(diff)}"
                     txt = f"{new_val}{arrow}"
 
                     ada_val = monthly_ada_new.get(m_idx, {}).get(day, 0)
@@ -405,7 +381,7 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
         ws.write(foot_r, 0, "* = ADA (Wheelchair) job(s)", left_fmt)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Email senders
+# Email
 # ─────────────────────────────────────────────────────────────────────────────
 def send_email_outlook(subject: str, body: str, to_emails: List[str], attachments: List[Tuple[str, bytes]]):
     if not HAS_OUTLOOK:
@@ -469,74 +445,40 @@ def send_email_smtp(
     server.quit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Orchestration
-# ─────────────────────────────────────────────────────────────────────────────
-def run_year_job(
-    drv: webdriver.Chrome,
-    year: int,
-    tmpdir: str,
-    uploaded_past_df: Optional[pd.DataFrame],
-    status_area=None,
-    progress=None
-) -> Tuple[str, str, pd.DataFrame]:
-    if status_area: status_area.write(f"Scraping year **{year}**…")
-    data = collect_all_data_for_year(drv, year, progress=progress)
-    if data.empty:
-        raise RuntimeError(f"No data scraped for {year}.")
-
-    old_raw_df = None
-    if uploaded_past_df is not None and not uploaded_past_df.empty:
-        old_raw_df = uploaded_past_df[uploaded_past_df["Year"] == year]
-        if old_raw_df.empty:
-            old_raw_df = None
-
-    raw_json_path = RAW_JSON_PATH(tmpdir, year)
-    data.to_json(raw_json_path, orient='records', indent=2)
-
-    excel_path = EXCEL_PATH(tmpdir, year)
-    if status_area: status_area.write(f"Generating Excel for **{year}**…")
-    generate_daily_totals_excel(data, year, excel_path, old_raw_df)
-
-    return excel_path, raw_json_path, data
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="TBN Scraper", page_icon="🚌", layout="wide")
 
 st.title("🚌 TBN Daily Usage Scraper")
-st.caption("Securely authenticate, scrape specified years, compare with past data, and export/email your reports.")
+st.caption("Authenticate → scrape → compare → export/email. Mobile-friendly when hosted.")
 
 with st.expander("Security & Ethics Notes", expanded=False):
     st.markdown(
-        "- Credentials are held in memory only for this session and are not written to disk.\n"
-        "- Consider OAuth/SSO for production deployments.\n"
-        "- Scrape only content you are authorized to access and respect the website’s Terms of Service."
+        "- Credentials are held only in memory for this session (not written to disk).\n"
+        "- Prefer OAuth/SSO for production if available.\n"
+        "- Scrape only data you’re authorized to access; respect Terms of Service."
     )
 
 # Sidebar: Authentication
 st.sidebar.header("Authentication")
 manual_login = st.sidebar.checkbox(
-    "Manual login (open a real browser window)",
+    "Manual login (open a visible browser)",
     value=False,
-    help="Use this if headless login fails or MFA/captcha is required."
+    help="Enable this if automated (headless) login fails or MFA/CAPTCHA is required."
 )
-auth_method = st.sidebar.selectbox("Method", ["Username & Password"], help="For production, prefer OAuth/SSO.")
-username = st.sidebar.text_input("TBN Username (email)", type="default", placeholder="you@company.com")
+username = st.sidebar.text_input("TBN Username (email)", placeholder="you@company.com")
 password = st.sidebar.text_input("TBN Password", type="password", placeholder="••••••••")
 
 # Sidebar: Parameters
 st.sidebar.header("Parameters")
-years_text = st.sidebar.text_input(
-    "Years to scrape",
-    value=str(datetime.now().year),
-    help='Examples: "2025", "2021-2024", or "2023, 2025-2026"'
-)
-email_text = st.sidebar.text_input("Send results to (optional)", value="", help="Comma- or semicolon-separated emails")
+years_text = st.sidebar.text_input("Years to scrape", value=str(datetime.now().year),
+                                   help='Examples: "2025", "2021-2024", or "2023, 2025-2026"')
+email_text = st.sidebar.text_input("Send results to (optional)", value="",
+                                   help="Comma- or semicolon-separated emails")
 
-# Sidebar: Past Data Upload
+# Past Data Upload
 st.sidebar.header("Past Data (Optional)")
-uploaded = st.sidebar.file_uploader("Upload prior TBN data (JSON or CSV)", type=["json","csv"])
+uploaded = st.sidebar.file_uploader("Upload prior TBN data (JSON or CSV)", type=["json", "csv"])
 
 uploaded_past_df: Optional[pd.DataFrame] = None
 if uploaded is not None:
@@ -550,17 +492,17 @@ if uploaded is not None:
             uploaded_past_df = pd.read_csv(uploaded)
         required_cols = {"Year", "Month"}
         if not required_cols.issubset(set(uploaded_past_df.columns)):
-            st.sidebar.warning(f"Uploaded file is missing expected columns: {required_cols}. Continuing without comparisons.")
+            st.sidebar.warning(f"Uploaded file missing columns: {required_cols}. Comparisons disabled.")
             uploaded_past_df = None
         else:
-            st.sidebar.success("Past data loaded. Comparisons enabled when years overlap.")
+            st.sidebar.success("Past data loaded. Comparisons enabled for overlapping years.")
     except Exception as e:
         st.sidebar.error(f"Could not read uploaded file: {e}")
         uploaded_past_df = None
 
-# Sidebar: Email
+# Email options
 st.sidebar.header("Email (Optional)")
-send_email = st.sidebar.checkbox("Email the results after scraping")
+send_email = st.sidebar.checkbox("Email results after scraping")
 email_backend = st.sidebar.selectbox("Email backend", ["Outlook (Windows only)", "SMTP"], disabled=not send_email)
 smtp_host = smtp_port = smtp_user = smtp_pass = None
 smtp_tls = True
@@ -571,20 +513,22 @@ if send_email:
         smtp_tls  = st.sidebar.checkbox("Use STARTTLS (uncheck for SSL)", value=True)
         smtp_user = st.sidebar.text_input("SMTP Username (from address)")
         smtp_pass = st.sidebar.text_input("SMTP Password / App Password", type="password")
-    elif email_backend == "Outlook (Windows only)" and not HAS_OUTLOOK:
-        st.sidebar.warning("Outlook COM not available on this system. Choose SMTP instead.")
+    else:
+        if not HAS_OUTLOOK:
+            st.sidebar.warning("Outlook COM is not available on this system. Choose SMTP instead.")
 
-# Main action
+# Action button
 colA, colB = st.columns([1,1])
 with colA:
     run_button = st.button("🚀 Run Scrape", type="primary")
 with colB:
-    st.download_button = st.empty()  # placeholder
+    st.download_button = st.empty()
 
-# Status & containers
+# Status UI
 status = st.empty()
 log_area = st.empty()
 progress_bar = st.progress(0.0, text="Idle")
+
 results_container = st.container()
 
 if run_button:
@@ -599,11 +543,11 @@ if run_button:
             to_emails = validate_email_list(email_text)
 
         if send_email and not to_emails:
-            st.error("You selected 'Email the results' but did not provide any valid recipient emails.")
+            st.error("You selected email delivery but no valid recipient emails were provided.")
             st.stop()
 
         if send_email and email_backend == "Outlook (Windows only)" and not HAS_OUTLOOK:
-            st.error("Outlook COM is not available. Please switch to SMTP.")
+            st.error("Outlook COM is not available. Switch to SMTP.")
             st.stop()
 
         if send_email and email_backend == "SMTP":
@@ -611,75 +555,68 @@ if run_button:
                 st.error("Please complete all SMTP fields (host, port, username, password).")
                 st.stop()
 
-        attachments: List[Tuple[str, bytes]] = []
-        summary_rows: List[Dict] = []
-
-        # ── Authentication ──────────────────────────────────────────────────
+        # ── Authenticate ────────────────────────────────────────────────────
         if manual_login:
-            status.info("Manual login mode: a Chrome window will open. Please log in, then click the button to continue.")
-            drv_vis = build_chrome(manual_visible=True)
-            drv_vis.get(LOGIN_URL)
-            st.info("Complete login in the Chrome window. When finished, click the button below.")
+            status.info("Manual login: a visible browser will open. Complete login, then continue.")
+            drv = build_chrome(manual_visible=True)
+            drv.get(LOGIN_URL)
+            st.info("After finishing login in the browser window, click the button below.")
             proceed = st.button("✅ I'm logged in — continue")
             if not proceed:
                 st.stop()
-
-            drv_vis.get(REPORT_URL); time.sleep(2)
-            if "login" in drv_vis.current_url.lower():
-                st.error("Still looks unauthenticated. Finish login in the browser window, then click the button again.")
+            drv.get(REPORT_URL)
+            time.sleep(2)
+            if "login" in drv.current_url.lower():
+                st.error("Still looks unauthenticated. Finish login and click the button again.")
                 st.stop()
-
-            # Try cookie handoff into headless for faster scraping
-            drv_headless = build_chrome(manual_visible=False)
-            copy_cookies(drv_vis, drv_headless, "https://portal.thebusnetwork.com/")
-            drv_headless.get(REPORT_URL); time.sleep(1.5)
-
-            if "login" in drv_headless.current_url.lower():
-                st.warning("Session cookies did not persist to headless. Continuing with visible browser for scraping.")
-                drv = drv_vis
-            else:
-                try:
-                    drv_vis.quit()
-                except Exception:
-                    pass
-                drv = drv_headless
-
-            log_area.success("Authenticated via manual mode.")
+            log_area.success("Authenticated (manual mode).")
         else:
             if not username or not password:
-                st.error("Please provide your TBN username and password (or enable Manual login).")
+                st.error("Provide username and password (or enable Manual login).")
                 st.stop()
             status.info("Starting headless browser and authenticating…")
-            log_area.info("Launching browser and attempting automated login.")
+            log_area.info("Attempting automated login…")
             drv = login_and_get_driver(username, password, log_area=log_area)
 
-        # ── Scrape years ────────────────────────────────────────────────────
+        # ── Scrape + Build ──────────────────────────────────────────────────
+        attachments: List[Tuple[str, bytes]] = []
+        summary_rows: List[Dict] = []
+
         with tempfile.TemporaryDirectory() as tmpdir:
             for idx, yr in enumerate(years, start=1):
                 progress_bar.progress((idx-1)/max(len(years),1), text=f"Processing {yr}")
                 try:
-                    excel_path, json_path, scraped_df = run_year_job(
-                        drv=drv,
-                        year=yr,
-                        tmpdir=tmpdir,
-                        uploaded_past_df=uploaded_past_df,
-                        status_area=log_area,
-                        progress=progress_bar
-                    )
+                    # Scrape
+                    data_df = collect_all_data_for_year(drv, yr, progress=progress_bar)
+                    if data_df.empty:
+                        st.warning(f"No data scraped for {yr}.")
+                        continue
 
+                    # Past data year slice (if uploaded)
+                    old_df = None
+                    if uploaded_past_df is not None and not uploaded_past_df.empty:
+                        slice_df = uploaded_past_df[uploaded_past_df["Year"] == yr]
+                        old_df = slice_df if not slice_df.empty else None
+
+                    # Save raw JSON
+                    raw_json_path = RAW_JSON_PATH(tmpdir, yr)
+                    data_df.to_json(raw_json_path, orient='records', indent=2)
+                    with open(raw_json_path, "rb") as f:
+                        json_bytes = f.read()
+                    attachments.append((os.path.basename(raw_json_path), json_bytes))
+
+                    # Build Excel
+                    excel_path = EXCEL_PATH(tmpdir, yr)
+                    generate_daily_totals_excel(data_df, yr, excel_path, old_df)
                     with open(excel_path, "rb") as f:
                         excel_bytes = f.read()
-                    with open(json_path, "rb") as f:
-                        json_bytes = f.read()
-
                     attachments.append((os.path.basename(excel_path), excel_bytes))
-                    attachments.append((os.path.basename(json_path), json_bytes))
 
-                    # Monthly summary for display
+                    # Summary table (monthly totals quick view)
                     month_map = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
                     ms = []
                     for m in range(1,13):
-                        sub = scraped_df[scraped_df["Month"]==m]
+                        sub = data_df[data_df["Month"] == m]
                         if sub.empty:
                             ms.append({"Year": yr, "Month": month_map[m], "Total Moves": 0})
                             continue
@@ -713,7 +650,7 @@ if run_button:
                             st.download_button(
                                 label=f"⬇️ Download Raw JSON ({yr})",
                                 data=json_bytes,
-                                file_name=os.path.basename(json_path),
+                                file_name=os.path.basename(raw_json_path),
                                 mime="application/json"
                             )
 
@@ -721,13 +658,11 @@ if run_button:
                     st.error(f"Failed to process {yr}: {e}")
                     continue
 
-        # Close driver
         try:
             drv.quit()
         except Exception:
             pass
 
-        # Yearly summary
         if summary_rows:
             summary_df = pd.DataFrame(summary_rows).sort_values("Year")
             st.subheader("Yearly Summary")
@@ -737,7 +672,7 @@ if run_button:
         progress_bar.progress(1.0, text="Completed.")
         status.success("Scraping and report generation complete.")
 
-        # Email step
+        # ── Email ───────────────────────────────────────────────────────────
         if send_email and attachments:
             st.divider()
             st.subheader("Email Delivery")
@@ -745,7 +680,7 @@ if run_button:
                 subj = "TBN Daily Totals Reports" if len(years) > 1 else f"TBN Daily Totals Report – {years[0]}"
                 body = (
                     "Hi,\n\nAttached are the updated TBN reports, including comparisons and ADA notes.\n\n"
-                    "Some values may be affected by data sync or processing delays. Let me know if anything looks off.\n\nThanks!"
+                    "Some values may be affected by data sync or processing delays.\n\nThanks!"
                 )
                 if email_backend == "Outlook (Windows only)":
                     send_email_outlook(subj, body, to_emails, attachments)
@@ -770,7 +705,4 @@ if run_button:
         st.stop()
 
 # Footer
-st.caption(
-    "Tip: For production, consider an OAuth/SSO login flow that redirects users through "
-    "TBN’s official login page and returns a session token for scraping. Avoid persisting passwords."
-)
+st.caption("For production, consider hosting on a server (EC2/Render/Streamlit Cloud) and accessing from your phone.")
