@@ -11,7 +11,7 @@ beautifulsoup4>=4.12.3
 lxml>=5.2.2
 html5lib>=1.1
 
-# Browser automation
+# Selenium (brings Selenium Manager for drivers)
 selenium>=4.22.0
 
 # Windows-only (Outlook email option)
