@@ -1,15 +1,10 @@
 # app.py
-# ─────────────────────────────────────────────────────────────────────────────
-# Streamlit TBN Scraper App (Production-ready, cross-platform, no Playwright)
-#
-# Highlights:
-# - Auto-installs Chrome for Testing (CfT) + matching ChromeDriver if Chrome isn't present
+# Production-focused Streamlit scraper with aggressive, clear fallbacks
+# - Browser selection: Chrome → CfT (auto-download) → Firefox → Edge
+# - Force a browser via UI if needed
 # - Manual-login fallback for MFA/CAPTCHA
-# - Headless by default; visible window only if manual login is enabled
-# - Responsive Streamlit UI (works on phones when hosted)
-# - SMTP / Outlook email options
-# - Past-data comparisons, Excel export, downloads
-# ─────────────────────────────────────────────────────────────────────────────
+# - Robust CfT extraction & path scanning, with diagnostics
+# - SMTP/Outlook email, Excel export, past-data comparisons
 
 import os
 import re
@@ -34,9 +29,13 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException
 
@@ -51,10 +50,11 @@ except Exception:
     HAS_OUTLOOK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 LOGIN_URL  = os.getenv("TBN_LOGIN_URL", "https://portal.thebusnetwork.com/login")
 REPORT_URL = os.getenv("TBN_REPORT_URL", "https://portal.thebusnetwork.com/salesman/reports/daily-usage")
+CFT_INFO_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
 
 def EXCEL_PATH(tmpdir: str, y: int) -> str:
     return os.path.join(tmpdir, f"TBN_Report_{y}.xlsx")
@@ -63,7 +63,7 @@ def RAW_JSON_PATH(tmpdir: str, y: int) -> str:
     return os.path.join(tmpdir, f"TBN_RawData_{y}.json")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -89,24 +89,15 @@ def validate_email_list(raw: str) -> List[str]:
         raise ValueError(f"Invalid email(s): {', '.join(bad)}")
     return emails
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chrome for Testing (CfT) bootstrap — self-healing without Playwright
-# ─────────────────────────────────────────────────────────────────────────────
-CFT_INFO_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
-
 def _platform_tag() -> str:
-    """Return CfT platform tag: linux64 | mac-x64 | mac-arm64 | win32 | win64."""
     sysname = platform.system().lower()
     machine = platform.machine().lower()
-
     if sysname == "linux":
         return "linux64"
     if sysname == "darwin":
         return "mac-arm64" if ("arm" in machine or "aarch" in machine) else "mac-x64"
     if sysname == "windows":
-        # Most modern Windows are 64-bit
         return "win64" if ("64" in machine or os.environ.get("PROGRAMFILES(X86)")) else "win32"
-    # Fallback
     return "linux64"
 
 def _download(url: str, dst: pathlib.Path):
@@ -114,166 +105,228 @@ def _download(url: str, dst: pathlib.Path):
     with urllib.request.urlopen(url) as resp, open(dst, "wb") as f:
         shutil.copyfileobj(resp, f)
 
-def _ensure_cft() -> Tuple[str, str]:
+def _tree_str(root: pathlib.Path, depth: int = 2) -> str:
+    if not root.exists():
+        return f"{root} (missing)"
+    out = []
+    base_len = len(str(root.parent))
+    for p in root.rglob("*"):
+        rel = str(p)[base_len+1:]
+        parts = rel.split(os.sep)
+        if len(parts) <= depth:
+            out.append(rel + ("/" if p.is_dir() else ""))
+    return "\n".join(out[:200])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chrome for Testing (CfT) robust bootstrap
+# ─────────────────────────────────────────────────────────────────────────────
+def _ensure_cft() -> Tuple[str, str, str]:
     """
     Ensure Chrome for Testing (chrome binary) and chromedriver exist for this platform.
-    Returns (chrome_binary_path, chromedriver_path).
-    Caches under ~/.cache/cft/<version>/<platform>/...
+    Returns (chrome_binary_path, chromedriver_path, version_dir).
     """
     tag = _platform_tag()
     cache_root = pathlib.Path.home() / ".cache" / "cft"
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    # Fetch CfT metadata
-    with urllib.request.urlopen(CFT_INFO_URL) as resp:
-        meta = json.load(resp)
+    try:
+        with urllib.request.urlopen(CFT_INFO_URL, timeout=30) as resp:
+            meta = json.load(resp)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch CfT metadata ({CFT_INFO_URL}): {e}")
 
-    stable = meta["channels"]["Stable"]["version"]
-    downloads = meta["channels"]["Stable"]["downloads"]
-    chrome_urls = [d["url"] for d in downloads["chrome"] if d["platform"] == tag]
-    driver_urls = [d["url"] for d in downloads["chromedriver"] if d["platform"] == tag]
-    if not chrome_urls or not driver_urls:
-        raise RuntimeError(f"No CfT downloads for platform '{tag}'")
-
-    chrome_zip_url = chrome_urls[0]
-    driver_zip_url = driver_urls[0]
+    try:
+        stable = meta["channels"]["Stable"]["version"]
+        downloads = meta["channels"]["Stable"]["downloads"]
+        chrome_zip_url = next(d["url"] for d in downloads["chrome"] if d["platform"] == tag)
+        driver_zip_url = next(d["url"] for d in downloads["chromedriver"] if d["platform"] == tag)
+    except Exception:
+        # Show what platforms we found for debugging
+        avail = {
+            "chrome": [d["platform"] for d in meta["channels"]["Stable"]["downloads"].get("chrome", [])],
+            "chromedriver": [d["platform"] for d in meta["channels"]["Stable"]["downloads"].get("chromedriver", [])]
+        }
+        raise RuntimeError(f"No CfT downloads for platform '{tag}'. Available: {avail}")
 
     version_dir = cache_root / stable / tag
     chrome_dir = version_dir / "chrome"
     driver_dir = version_dir / "chromedriver"
-    chrome_bin = None
-    driver_bin = None
+    chrome_bin: Optional[str] = None
+    driver_bin: Optional[str] = None
 
-    # Detect already extracted
-    if "linux" in tag:
-        chrome_bin = chrome_dir / "chrome-linux" / "chrome"
-        driver_bin = driver_dir / "chromedriver-linux64" / "chromedriver"
-    elif tag == "mac-x64":
-        chrome_bin = chrome_dir / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
-        driver_bin = driver_dir / "chromedriver-mac-x64" / "chromedriver"
-    elif tag == "mac-arm64":
-        chrome_bin = chrome_dir / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
-        driver_bin = driver_dir / "chromedriver-mac-arm64" / "chromedriver"
-    elif tag in ("win32", "win64"):
-        chrome_bin = chrome_dir / f"chrome-{tag}" / "chrome.exe"
-        driver_bin = driver_dir / f"chromedriver-{tag}" / "chromedriver.exe"
+    def scan_for(names: List[str], root: pathlib.Path) -> Optional[str]:
+        if not root.exists():
+            return None
+        for p in root.rglob("*"):
+            if p.is_file() and p.name in names:
+                try:
+                    if os.name != "nt":
+                        p.chmod(p.stat().st_mode | 0o111)
+                except Exception:
+                    pass
+                return str(p)
+        return None
 
-    # Download/extract if missing
-    if not (chrome_bin and chrome_bin.exists()) or not (driver_bin and driver_bin.exists()):
-        # Clean version dir to avoid mixing versions
+    # Fast path
+    chrome_bin = scan_for(["chrome", "Google Chrome for Testing", "chrome.exe"], chrome_dir)
+    driver_bin = scan_for(["chromedriver", "chromedriver.exe"], driver_dir)
+
+    if not chrome_bin or not driver_bin:
+        # Clean/prepare
         if version_dir.exists():
             shutil.rmtree(version_dir, ignore_errors=True)
         chrome_dir.mkdir(parents=True, exist_ok=True)
         driver_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download zips
+        # Download & extract
         chrome_zip = version_dir / "chrome.zip"
         driver_zip = version_dir / "chromedriver.zip"
-        _download(chrome_zip_url, chrome_zip)
-        _download(driver_zip_url, driver_zip)
-
-        # Extract
-        with zipfile.ZipFile(chrome_zip, "r") as z:
-            z.extractall(chrome_dir)
-        with zipfile.ZipFile(driver_zip, "r") as z:
-            z.extractall(driver_dir)
-
-        # Recompute bin paths after extraction (same as above)
-        if "linux" in tag:
-            chrome_bin = chrome_dir / "chrome-linux" / "chrome"
-            driver_bin = driver_dir / "chromedriver-linux64" / "chromedriver"
-        elif tag == "mac-x64":
-            chrome_bin = chrome_dir / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
-            driver_bin = driver_dir / "chromedriver-mac-x64" / "chromedriver"
-        elif tag == "mac-arm64":
-            chrome_bin = chrome_dir / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
-            driver_bin = driver_dir / "chromedriver-mac-arm64" / "chromedriver"
-        elif tag in ("win32", "win64"):
-            chrome_bin = chrome_dir / f"chrome-{tag}" / "chrome.exe"
-            driver_bin = driver_dir / f"chromedriver-{tag}" / "chromedriver.exe"
-
-        # Make sure binaries are executable on *nix
         try:
-            if chrome_bin and chrome_bin.exists() and os.name != "nt":
-                chrome_bin.chmod(0o755)
-            if driver_bin and driver_bin.exists() and os.name != "nt":
-                driver_bin.chmod(0o755)
-        except Exception:
-            pass
+            _download(chrome_zip_url, chrome_zip)
+            _download(driver_zip_url, driver_zip)
+        except Exception as e:
+            raise RuntimeError(f"Downloading CfT archives failed. Check proxy/firewall.\n{e}")
 
-        # Clean zip files
+        try:
+            with zipfile.ZipFile(chrome_zip, "r") as z:
+                z.extractall(chrome_dir)
+            with zipfile.ZipFile(driver_zip, "r") as z:
+                z.extractall(driver_dir)
+        except Exception as e:
+            raise RuntimeError(f"Extracting CfT archives failed: {e}")
+
+        # Rescan
+        chrome_bin = scan_for(["chrome", "Google Chrome for Testing", "chrome.exe"], chrome_dir)
+        driver_bin = scan_for(["chromedriver", "chromedriver.exe"], driver_dir)
+
+        # Cleanup zips
         try:
             chrome_zip.unlink(missing_ok=True)
             driver_zip.unlink(missing_ok=True)
         except Exception:
             pass
 
-    if not chrome_bin or not chrome_bin.exists():
-        raise RuntimeError("Chrome for Testing binary not found after install.")
-    if not driver_bin or not driver_bin.exists():
-        raise RuntimeError("ChromeDriver binary not found after install.")
+    if not chrome_bin or not driver_bin:
+        diag = (
+            f"Chrome for Testing binary not found after install.\n"
+            f"Version dir: {version_dir}\n\n"
+            f"chrome/ tree (depth 2):\n{_tree_str(chrome_dir,2)}\n\n"
+            f"chromedriver/ tree (depth 2):\n{_tree_str(driver_dir,2)}\n"
+        )
+        raise RuntimeError(diag)
 
-    return (str(chrome_bin), str(driver_bin))
+    return chrome_bin, driver_bin, str(version_dir)
 
-def build_chrome(manual_visible: bool = False) -> webdriver.Chrome:
+# ─────────────────────────────────────────────────────────────────────────────
+# Driver builders (Chrome/CfT → Firefox → Edge)
+# ─────────────────────────────────────────────────────────────────────────────
+def _common_chrome_opts(headless: bool) -> ChromeOptions:
+    o = ChromeOptions()
+    if headless:
+        o.add_argument("--headless=new")
+    o.add_argument("--window-size=1920,1080")
+    o.add_argument("--no-sandbox")
+    o.add_argument("--disable-dev-shm-usage")
+    o.add_argument("--disable-extensions")
+    o.add_argument("--disable-gpu")
+    o.add_argument("--disable-blink-features=AutomationControlled")
+    return o
+
+def _common_firefox_opts(headless: bool) -> FirefoxOptions:
+    o = FirefoxOptions()
+    if headless:
+        o.add_argument("--headless")
+    return o
+
+def _common_edge_opts(headless: bool) -> EdgeOptions:
+    o = EdgeOptions()
+    if headless:
+        o.add_argument("headless")
+        o.add_argument("disable-gpu")
+    o.add_argument("window-size=1920,1080")
+    return o
+
+def build_driver(preferred: str = "auto", manual_visible: bool = False, log_area=None) -> webdriver.Remote:
     """
-    Build a Chrome driver that 'just works':
-      1) Use CHROME_PATH env or a system chrome/chromium if present.
-      2) Else auto-download Chrome for Testing + matching ChromeDriver and use them.
-    Headless unless manual_visible=True.
+    preferred: "auto" | "chrome" | "firefox" | "edge"
+    Tries system Chrome → CfT → Firefox → Edge.
     """
-    opts = ChromeOptions()
-    if not manual_visible:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+    headless = not manual_visible
 
-    # 1) Try env/system chrome
-    binary = os.getenv("CHROME_PATH")
-    if not binary:
-        for cand in ("google-chrome", "chromium", "chromium-browser"):
-            p = shutil.which(cand)
-            if p:
-                binary = p
-                break
+    def try_chrome_system():
+        opts = _common_chrome_opts(headless)
+        # Env-specified chrome
+        binary = os.getenv("CHROME_PATH")
+        if binary and os.path.exists(binary):
+            opts.binary_location = binary
+        else:
+            for cand in ("google-chrome", "chromium", "chromium-browser"):
+                p = shutil.which(cand)
+                if p:
+                    opts.binary_location = p
+                    break
+        driver = webdriver.Chrome(options=opts)  # Selenium Manager resolves driver
+        driver.set_page_load_timeout(45)
+        return driver
 
-    if binary:
-        opts.binary_location = binary
-        try:
-            driver = webdriver.Chrome(options=opts)  # Selenium Manager finds driver for system chrome
-            driver.set_page_load_timeout(45)
-            return driver
-        except WebDriverException:
-            # fallback to CfT
-            pass
-
-    # 2) CfT fallback
-    chrome_bin, driver_bin = _ensure_cft()
-    opts.binary_location = chrome_bin
-    service = ChromeService(executable_path=driver_bin)
-    try:
+    def try_chrome_cft():
+        opts = _common_chrome_opts(headless)
+        chrome_bin, driver_bin, ver_dir = _ensure_cft()
+        if log_area:
+            log_area.info(f"Using Chrome for Testing at {ver_dir}")
+        opts.binary_location = chrome_bin
+        service = ChromeService(executable_path=driver_bin)
         driver = webdriver.Chrome(service=service, options=opts)
         driver.set_page_load_timeout(45)
         return driver
-    except WebDriverException as e:
-        raise RuntimeError(f"Failed to start Chrome. Details: {e}") from e
+
+    def try_firefox():
+        opts = _common_firefox_opts(headless)
+        service = FirefoxService()  # Selenium Manager pulls geckodriver
+        driver = webdriver.Firefox(service=service, options=opts)
+        driver.set_page_load_timeout(45)
+        return driver
+
+    def try_edge():
+        opts = _common_edge_opts(headless)
+        service = EdgeService()  # Selenium Manager pulls msedgedriver
+        driver = webdriver.Edge(service=service, options=opts)
+        driver.set_page_load_timeout(45)
+        return driver
+
+    # Order based on "preferred"
+    attempts = []
+    if preferred == "chrome":
+        attempts = [try_chrome_system, try_chrome_cft, try_firefox, try_edge]
+    elif preferred == "firefox":
+        attempts = [try_firefox, try_chrome_system, try_chrome_cft, try_edge]
+    elif preferred == "edge":
+        attempts = [try_edge, try_chrome_system, try_chrome_cft, try_firefox]
+    else:  # auto
+        attempts = [try_chrome_system, try_chrome_cft, try_firefox, try_edge]
+
+    last_err = None
+    for fn in attempts:
+        try:
+            if log_area: log_area.info(f"Trying browser: {fn.__name__}")
+            drv = fn()
+            return drv
+        except Exception as e:
+            last_err = e
+            if log_area: log_area.warning(f"{fn.__name__} failed: {e}")
+            continue
+
+    raise RuntimeError(f"All browser attempts failed. Last error:\n{last_err}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Selenium login & scraping
+# Login & scraping
 # ─────────────────────────────────────────────────────────────────────────────
-def login_and_get_driver(username: str, password: str, log_area=None) -> webdriver.Chrome:
-    """
-    Automated login. If your portal enforces CAPTCHA/MFA, use the manual login mode.
-    """
-    drv = build_chrome(manual_visible=False)
+def login_and_get_driver(username: str, password: str, browser_choice: str, manual_visible: bool, log_area=None) -> webdriver.Remote:
+    drv = build_driver(preferred=browser_choice, manual_visible=manual_visible, log_area=log_area)
     drv.get(LOGIN_URL)
     wait = WebDriverWait(drv, 30)
 
-    # If the login is within an iframe, switch in
+    # If the login is inside an iframe, try switching in
     frames = drv.find_elements(By.TAG_NAME, "iframe")
     if frames:
         try:
@@ -286,15 +339,12 @@ def login_and_get_driver(username: str, password: str, log_area=None) -> webdriv
         return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
 
     try:
-        # Email/username
         email = find_el("input[name='email'], input#email, input#username, input[type='email']")
         email.clear(); email.send_keys(username)
 
-        # Password
         pwd = find_el("input[name='password'], input#password, input[type='password']")
         pwd.clear(); pwd.send_keys(password)
 
-        # Submit button + Enter (cover both patterns)
         try:
             btn = wait.until(EC.element_to_be_clickable((
                 By.XPATH, "//button[@type='submit' or contains(., 'Log') or contains(., 'Sign')]"
@@ -309,29 +359,23 @@ def login_and_get_driver(username: str, password: str, log_area=None) -> webdriv
         drv.switch_to.default_content()
         time.sleep(2)
 
-        # Probe the report page to confirm auth
         drv.get(REPORT_URL)
         time.sleep(2)
         if ("login" in drv.current_url.lower()) or ("signin" in drv.current_url.lower()):
             drv.refresh()
             time.sleep(2)
 
-        # Check for the report/table presence
-        try:
-            WebDriverWait(drv, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table, .table, div[data-report], #report"))
-            )
-        except Exception:
-            raise RuntimeError("Login failed or report not found.")
-
+        WebDriverWait(drv, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table, .table, div[data-report], #report"))
+        )
         if log_area: log_area.success("Authenticated successfully.")
         return drv
     except Exception:
-        snippet = drv.page_source[:800] if drv.page_source else "No page source available."
+        snippet = (drv.page_source[:1200] if getattr(drv, "page_source", None) else "No page source.")
         if log_area:
-            log_area.code(f"URL: {drv.current_url}\n\nHTML (first 800 chars):\n{snippet}")
+            log_area.code(f"URL: {drv.current_url}\n\nHTML (first 1200 chars):\n{snippet}")
         drv.quit()
-        raise
+        raise RuntimeError("Login failed or report not found.")
 
 def set_datepicker(drv, month: int, year: int):
     wait = WebDriverWait(drv, 20)
@@ -345,9 +389,9 @@ def set_datepicker(drv, month: int, year: int):
 
 def scrape_month_data(drv, year: int, month: int) -> Optional[pd.DataFrame]:
     drv.get(REPORT_URL)
-    time.sleep(1.5)
+    time.sleep(1.3)
     set_datepicker(drv, month, year)
-    time.sleep(2)
+    time.sleep(1.8)
     soup = BeautifulSoup(drv.page_source, 'html.parser')
     tbl  = soup.find('table')
     if not tbl:
@@ -368,7 +412,7 @@ def collect_all_data_for_year(drv, year: int, progress=None) -> pd.DataFrame:
     return pd.concat(all_df, ignore_index=True) if all_df else pd.DataFrame()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Report builder (full Excel, ADA markers + weekend shading + comparisons)
+# Excel report (with ADA markers & weekend shading + comparisons)
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: str, old_raw_df: Optional[pd.DataFrame] = None):
     monthly_totals_new: Dict[int, Dict[int, int]] = {}
@@ -377,7 +421,6 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
     for m in range(1, 13):
         sub = new_data[new_data['Month'] == m]
 
-        # Totals row
         tot = sub[sub['Vehicle Types'].str.upper().str.contains("TOTAL", na=False)]
         if not tot.empty:
             tot = tot.iloc[0]
@@ -386,7 +429,6 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
             tot = sub[days].sum(numeric_only=True)
         monthly_totals_new[m] = {d: int(tot.get(str(d), 0) or 0) for d in range(1, 32)}
 
-        # ADA (Wheelchair)
         wc = sub[sub['Vehicle Types'].str.contains("Wheelchair", case=False, na=False)]
         if not wc.empty:
             wc = wc.iloc[0]
@@ -394,9 +436,8 @@ def generate_daily_totals_excel(new_data: pd.DataFrame, year: int, excel_path: s
         else:
             monthly_ada_new[m] = {d: 0 for d in range(1, 32)}
 
-    # Old totals (for comparisons)
     if old_raw_df is not None and not old_raw_df.empty:
-        monthly_totals_old: Optional[Dict[int, Dict[int, int]]] = {}
+        monthly_totals_old: Dict[int, Dict[int, int]] = {}
         for m in range(1, 13):
             sub = old_raw_df[old_raw_df['Month'] == m]
             tot = sub[sub['Vehicle Types'].str.upper().str.contains("TOTAL", na=False)]
@@ -559,22 +600,20 @@ def send_email_smtp(
 st.set_page_config(page_title="TBN Scraper", page_icon="🚌", layout="wide")
 
 st.title("🚌 TBN Daily Usage Scraper")
-st.caption("Authenticate → scrape → compare → export/email. Mobile-friendly when hosted.")
+st.caption("Authenticate → scrape → compare → export/email. Host it and use from your phone.")
 
 with st.expander("Security & Ethics Notes", expanded=False):
     st.markdown(
-        "- Credentials are held only in memory for this session (not written to disk).\n"
-        "- Prefer OAuth/SSO for production if available.\n"
-        "- Scrape only data you’re authorized to access; respect Terms of Service."
+        "- Credentials live only in memory for this session.\n"
+        "- For production, prefer OAuth/SSO.\n"
+        "- Scrape only data you’re authorized to access."
     )
 
 # Sidebar: Authentication
 st.sidebar.header("Authentication")
-manual_login = st.sidebar.checkbox(
-    "Manual login (open a visible browser)",
-    value=False,
-    help="Enable this if automated (headless) login fails or MFA/CAPTCHA is required."
-)
+manual_login = st.sidebar.checkbox("Manual login (visible browser window)", value=False)
+browser_choice = st.sidebar.selectbox("Preferred browser", ["auto", "chrome", "firefox", "edge"],
+                                      help="If one fails, the app falls back automatically.")
 username = st.sidebar.text_input("TBN Username (email)", placeholder="you@company.com")
 password = st.sidebar.text_input("TBN Password", type="password", placeholder="••••••••")
 
@@ -582,8 +621,7 @@ password = st.sidebar.text_input("TBN Password", type="password", placeholder="�
 st.sidebar.header("Parameters")
 years_text = st.sidebar.text_input("Years to scrape", value=str(datetime.now().year),
                                    help='Examples: "2025", "2021-2024", or "2023, 2025-2026"')
-email_text = st.sidebar.text_input("Send results to (optional)", value="",
-                                   help="Comma- or semicolon-separated emails")
+email_text = st.sidebar.text_input("Send results to (optional)", value="", help="Comma- or semicolon-separated emails")
 
 # Past Data Upload
 st.sidebar.header("Past Data (Optional)")
@@ -601,10 +639,10 @@ if uploaded is not None:
             uploaded_past_df = pd.read_csv(uploaded)
         required_cols = {"Year", "Month"}
         if not required_cols.issubset(set(uploaded_past_df.columns)):
-            st.sidebar.warning(f"Uploaded file missing columns: {required_cols}. Comparisons disabled.")
+            st.sidebar.warning(f"Uploaded file is missing {required_cols}. Comparisons disabled.")
             uploaded_past_df = None
         else:
-            st.sidebar.success("Past data loaded. Comparisons enabled for overlapping years.")
+            st.sidebar.success("Past data loaded; comparisons enabled when years overlap.")
     except Exception as e:
         st.sidebar.error(f"Could not read uploaded file: {e}")
         uploaded_past_df = None
@@ -626,14 +664,14 @@ if send_email:
         if not HAS_OUTLOOK:
             st.sidebar.warning("Outlook COM is not available on this system. Choose SMTP instead.")
 
-# Action button
+# Action
 colA, colB = st.columns([1,1])
 with colA:
     run_button = st.button("🚀 Run Scrape", type="primary")
 with colB:
     st.download_button = st.empty()
 
-# Status UI
+# Status
 status = st.empty()
 log_area = st.empty()
 progress_bar = st.progress(0.0, text="Idle")
@@ -652,7 +690,7 @@ if run_button:
             to_emails = validate_email_list(email_text)
 
         if send_email and not to_emails:
-            st.error("You selected email delivery but no valid recipient emails were provided.")
+            st.error("You selected email delivery but provided no valid recipient emails.")
             st.stop()
 
         if send_email and email_backend == "Outlook (Windows only)" and not HAS_OUTLOOK:
@@ -667,25 +705,25 @@ if run_button:
         # ── Authenticate ────────────────────────────────────────────────────
         if manual_login:
             status.info("Manual login: a visible browser will open. Complete login, then continue.")
-            drv = build_chrome(manual_visible=True)
+            drv = build_driver(preferred=browser_choice, manual_visible=True, log_area=log_area)
             drv.get(LOGIN_URL)
-            st.info("After finishing login in the browser window, click the button below.")
+            st.info("Finish login in the browser window, then click the button below.")
             proceed = st.button("✅ I'm logged in — continue")
             if not proceed:
                 st.stop()
             drv.get(REPORT_URL)
             time.sleep(2)
             if "login" in drv.current_url.lower():
-                st.error("Still looks unauthenticated. Finish login and click the button again.")
+                st.error("Still looks unauthenticated. Finish login, then click the button again.")
                 st.stop()
             log_area.success("Authenticated (manual mode).")
         else:
             if not username or not password:
                 st.error("Provide username and password (or enable Manual login).")
                 st.stop()
-            status.info("Starting headless browser and authenticating…")
-            log_area.info("Attempting automated login…")
-            drv = login_and_get_driver(username, password, log_area=log_area)
+            status.info("Starting browser and authenticating…")
+            log_area.info(f"Preferred browser: {browser_choice}")
+            drv = login_and_get_driver(username, password, browser_choice, manual_visible=False, log_area=log_area)
 
         # ── Scrape + Build ──────────────────────────────────────────────────
         attachments: List[Tuple[str, bytes]] = []
@@ -695,33 +733,29 @@ if run_button:
             for idx, yr in enumerate(years, start=1):
                 progress_bar.progress((idx-1)/max(len(years),1), text=f"Processing {yr}")
                 try:
-                    # Scrape
                     data_df = collect_all_data_for_year(drv, yr, progress=progress_bar)
                     if data_df.empty:
                         st.warning(f"No data scraped for {yr}.")
                         continue
 
-                    # Past data year slice (if uploaded)
                     old_df = None
                     if uploaded_past_df is not None and not uploaded_past_df.empty:
                         slice_df = uploaded_past_df[uploaded_past_df["Year"] == yr]
                         old_df = slice_df if not slice_df.empty else None
 
-                    # Save raw JSON
                     raw_json_path = RAW_JSON_PATH(tmpdir, yr)
                     data_df.to_json(raw_json_path, orient='records', indent=2)
                     with open(raw_json_path, "rb") as f:
                         json_bytes = f.read()
                     attachments.append((os.path.basename(raw_json_path), json_bytes))
 
-                    # Build Excel
                     excel_path = EXCEL_PATH(tmpdir, yr)
                     generate_daily_totals_excel(data_df, yr, excel_path, old_df)
                     with open(excel_path, "rb") as f:
                         excel_bytes = f.read()
                     attachments.append((os.path.basename(excel_path), excel_bytes))
 
-                    # Summary table (monthly totals quick view)
+                    # Summary table (monthly totals)
                     month_map = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
                     ms = []
                     for m in range(1,13):
@@ -814,4 +848,4 @@ if run_button:
         st.stop()
 
 # Footer
-st.caption("Host this app (e.g., on a VM/Cloud) and open the URL from your laptop or iPhone. The scraper runs on the host.")
+st.caption("If a browser fails, switch 'Preferred browser' in the sidebar or enable Manual login (visible browser).")
