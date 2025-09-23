@@ -16,6 +16,7 @@ import zipfile
 import tempfile
 import platform
 import pathlib
+import subprocess
 import urllib.request
 from datetime import datetime
 from io import StringIO
@@ -105,7 +106,7 @@ def _download(url: str, dst: pathlib.Path):
     with urllib.request.urlopen(url) as resp, open(dst, "wb") as f:
         shutil.copyfileobj(resp, f)
 
-def _tree_str(root: pathlib.Path, depth: int = 2) -> str:
+def _tree_str(root: pathlib.Path, depth: int = 3) -> str:
     if not root.exists():
         return f"{root} (missing)"
     out = []
@@ -115,7 +116,33 @@ def _tree_str(root: pathlib.Path, depth: int = 2) -> str:
         parts = rel.split(os.sep)
         if len(parts) <= depth:
             out.append(rel + ("/" if p.is_dir() else ""))
-    return "\n".join(out[:200])
+    return "\n".join(out[:400])
+
+def _chmod_executable(p: pathlib.Path):
+    try:
+        if os.name != "nt":
+            p.chmod(p.stat().st_mode | 0o111)
+    except Exception:
+        pass
+
+def _macos_unquarantine(path: pathlib.Path):
+    if platform.system().lower() == "darwin":
+        try:
+            subprocess.run(
+                ["xattr", "-dr", "com.apple.quarantine", str(path)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            pass
+
+def _verify_runs(cmd: List[str]) -> bool:
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        return proc.returncode == 0
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chrome for Testing (CfT) robust bootstrap
@@ -141,7 +168,6 @@ def _ensure_cft() -> Tuple[str, str, str]:
         chrome_zip_url = next(d["url"] for d in downloads["chrome"] if d["platform"] == tag)
         driver_zip_url = next(d["url"] for d in downloads["chromedriver"] if d["platform"] == tag)
     except Exception:
-        # Show what platforms we found for debugging
         avail = {
             "chrome": [d["platform"] for d in meta["channels"]["Stable"]["downloads"].get("chrome", [])],
             "chromedriver": [d["platform"] for d in meta["channels"]["Stable"]["downloads"].get("chromedriver", [])]
@@ -155,30 +181,37 @@ def _ensure_cft() -> Tuple[str, str, str]:
     driver_bin: Optional[str] = None
 
     def scan_for(names: List[str], root: pathlib.Path) -> Optional[str]:
+        """
+        Recursively look for any file whose name (case-insensitive) matches one in 'names'.
+        Handles nested CfT folders (e.g., chrome-mac-*/Google Chrome for Testing.app/Contents/MacOS/...).
+        """
         if not root.exists():
             return None
+        lower_names = [n.lower() for n in names]
         for p in root.rglob("*"):
-            if p.is_file() and p.name in names:
-                try:
-                    if os.name != "nt":
-                        p.chmod(p.stat().st_mode | 0o111)
-                except Exception:
-                    pass
+            if p.is_file() and p.name.lower() in lower_names:
+                _chmod_executable(p)
                 return str(p)
         return None
 
-    # Fast path
-    chrome_bin = scan_for(["chrome", "Google Chrome for Testing", "chrome.exe"], chrome_dir)
-    driver_bin = scan_for(["chromedriver", "chromedriver.exe"], driver_dir)
+    # Fast path (already extracted previously)
+    chrome_bin = scan_for(
+        ["chrome", "chrome.exe", "Google Chrome for Testing"],
+        chrome_dir
+    )
+    driver_bin = scan_for(
+        ["chromedriver", "chromedriver.exe"],
+        driver_dir
+    )
 
     if not chrome_bin or not driver_bin:
-        # Clean/prepare
+        # Clean & prepare
         if version_dir.exists():
             shutil.rmtree(version_dir, ignore_errors=True)
         chrome_dir.mkdir(parents=True, exist_ok=True)
         driver_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download & extract
+        # Download archives
         chrome_zip = version_dir / "chrome.zip"
         driver_zip = version_dir / "chromedriver.zip"
         try:
@@ -187,6 +220,7 @@ def _ensure_cft() -> Tuple[str, str, str]:
         except Exception as e:
             raise RuntimeError(f"Downloading CfT archives failed. Check proxy/firewall.\n{e}")
 
+        # Extract
         try:
             with zipfile.ZipFile(chrome_zip, "r") as z:
                 z.extractall(chrome_dir)
@@ -195,10 +229,6 @@ def _ensure_cft() -> Tuple[str, str, str]:
         except Exception as e:
             raise RuntimeError(f"Extracting CfT archives failed: {e}")
 
-        # Rescan
-        chrome_bin = scan_for(["chrome", "Google Chrome for Testing", "chrome.exe"], chrome_dir)
-        driver_bin = scan_for(["chromedriver", "chromedriver.exe"], driver_dir)
-
         # Cleanup zips
         try:
             chrome_zip.unlink(missing_ok=True)
@@ -206,12 +236,39 @@ def _ensure_cft() -> Tuple[str, str, str]:
         except Exception:
             pass
 
+        # Rescan
+        chrome_bin = scan_for(
+            ["chrome", "chrome.exe", "Google Chrome for Testing"],
+            chrome_dir
+        )
+        driver_bin = scan_for(
+            ["chromedriver", "chromedriver.exe"],
+            driver_dir
+        )
+
+    # Extra macOS handling: unquarantine and ensure exec bit; also resolve .app bundle path for message clarity
+    if platform.system().lower() == "darwin":
+        # Unquarantine entire extracted folders
+        _macos_unquarantine(chrome_dir)
+        _macos_unquarantine(driver_dir)
+        if chrome_bin:
+            _macos_unquarantine(pathlib.Path(chrome_bin))
+        if driver_bin:
+            _macos_unquarantine(pathlib.Path(driver_bin))
+
+    # Final verification and diagnostics
+    if chrome_bin:
+        # Try "--version" to ensure the binary is runnable
+        _verify_runs([chrome_bin, "--version"])  # Best-effort; don't fail here
+    if driver_bin:
+        _verify_runs([driver_bin, "--version"])
+
     if not chrome_bin or not driver_bin:
         diag = (
             f"Chrome for Testing binary not found after install.\n"
             f"Version dir: {version_dir}\n\n"
-            f"chrome/ tree (depth 2):\n{_tree_str(chrome_dir,2)}\n\n"
-            f"chromedriver/ tree (depth 2):\n{_tree_str(driver_dir,2)}\n"
+            f"chrome/ tree (depth 3):\n{_tree_str(chrome_dir,3)}\n\n"
+            f"chromedriver/ tree (depth 3):\n{_tree_str(driver_dir,3)}\n"
         )
         raise RuntimeError(diag)
 
